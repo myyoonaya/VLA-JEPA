@@ -48,6 +48,16 @@ framework:
     embodied_action_token: "<|embodied_action|>"
     num_embodied_action_tokens_per_instruction: 32
     num_frames: 8
+  future_interface:
+    enabled: false
+    token_dim: 1024
+    n_prog: 1
+    n_int: 1
+    n_obj: 1
+    losses:
+      alpha_fm: 1.0
+      beta_wm: 0.1
+      lambda_bridge: 0.0
   reduce_in_full_precision: true
 
 

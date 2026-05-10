@@ -28,6 +28,7 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
+from starVLA.model.modules.future_interface import FutureTokenPredictor, WorldSummaryExtractor
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -80,6 +81,7 @@ class VLA_JEPA(baseframework):
         
         self.vj_encoder = AutoModel.from_pretrained(self.config.framework.vj2_model.base_encoder)
         self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
+        self._freeze_world_teacher()
 
         tubelet_size = self.vj_encoder.config.tubelet_size
         self.vj_predictor = VisionTransformerPredictorAC(
@@ -98,6 +100,18 @@ class VLA_JEPA(baseframework):
         )
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
+
+        future_interface_cfg = self.config.framework.get("future_interface", {})
+        self.future_interface_enabled = bool(future_interface_cfg.get("enabled", False))
+        if self.future_interface_enabled:
+            self.future_token_predictor = FutureTokenPredictor(
+                vlm_dim=self.qwen_vl_interface.model.config.hidden_size,
+                token_dim=future_interface_cfg.get("token_dim", self.config.framework.action_model.hidden_size),
+                n_prog=future_interface_cfg.get("n_prog", 1),
+                n_int=future_interface_cfg.get("n_int", 1),
+                n_obj=future_interface_cfg.get("n_obj", 1),
+            )
+            self.world_summary_extractor = WorldSummaryExtractor()
 
     def expand_tokenizer(self, 
                          tokenizer: AutoTokenizer,
@@ -127,6 +141,29 @@ class VLA_JEPA(baseframework):
             self.qwen_vl_interface.model.resize_token_embeddings(len(tokenizer))
         logger.info(f"Model embedding size: {vla_embedding_size} ;tokenizer.vocab_size: {len(tokenizer)}")
         return action_tokens, action_token_ids, embodied_action_token_id
+
+    def _freeze_world_teacher(self):
+        self.vj_encoder.eval()
+        for param in self.vj_encoder.parameters():
+            param.requires_grad = False
+
+    def _get_loss_weight(self, name: str, default: float):
+        future_interface_cfg = self.config.framework.get("future_interface", {})
+        losses_cfg = future_interface_cfg.get("losses", {})
+        return float(losses_cfg.get(name, default))
+
+    def _build_loss_dict(self, action_loss_raw: torch.Tensor, wm_loss_raw: torch.Tensor):
+        alpha_fm = self._get_loss_weight("alpha_fm", 1.0)
+        beta_wm = self._get_loss_weight("beta_wm", 0.1)
+        losses = {
+            "action_loss": action_loss_raw * alpha_fm,
+            "wm_loss": wm_loss_raw * beta_wm,
+        }
+        metrics = {
+            "action_loss_raw": action_loss_raw.detach(),
+            "wm_loss_raw": wm_loss_raw.detach(),
+        }
+        return losses, metrics
 
     def forward(
         self,
@@ -244,7 +281,7 @@ class VLA_JEPA(baseframework):
             )
         
         if "action" not in examples[0]:
-            return {"wm_loss": teacher_forcing_wm_loss}
+            return {"wm_loss": teacher_forcing_wm_loss * self._get_loss_weight("beta_wm", 0.1)}
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
@@ -272,7 +309,8 @@ class VLA_JEPA(baseframework):
             #exit()
             action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
 
-        return {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
+        losses, _ = self._build_loss_dict(action_loss, teacher_forcing_wm_loss)
+        return losses
 
     @torch.inference_mode()
     def predict_action(
