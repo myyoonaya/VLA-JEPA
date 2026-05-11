@@ -28,7 +28,7 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
-from starVLA.model.modules.future_interface import FutureTokenPredictor, WorldSummaryExtractor
+from starVLA.model.modules.future_interface import FutureTokenPredictor, WorldSummaryExtractor, bridge_loss
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -104,14 +104,25 @@ class VLA_JEPA(baseframework):
         future_interface_cfg = self.config.framework.get("future_interface", {})
         self.future_interface_enabled = bool(future_interface_cfg.get("enabled", False))
         if self.future_interface_enabled:
+            qwen_hidden_size = self.qwen_vl_interface.model.config.hidden_size
+            future_token_dim = future_interface_cfg.get("token_dim", self.config.framework.action_model.hidden_size)
             self.future_token_predictor = FutureTokenPredictor(
-                vlm_dim=self.qwen_vl_interface.model.config.hidden_size,
-                token_dim=future_interface_cfg.get("token_dim", self.config.framework.action_model.hidden_size),
+                vlm_dim=qwen_hidden_size,
+                token_dim=future_token_dim,
                 n_prog=future_interface_cfg.get("n_prog", 1),
                 n_int=future_interface_cfg.get("n_int", 1),
                 n_obj=future_interface_cfg.get("n_obj", 1),
             )
             self.world_summary_extractor = WorldSummaryExtractor()
+            teacher_dim = self.vj_encoder.config.hidden_size * 2
+            self.future_teacher_projector = (
+                nn.Identity() if teacher_dim == future_token_dim else nn.Linear(teacher_dim, future_token_dim)
+            )
+            for param in self.future_teacher_projector.parameters():
+                param.requires_grad = False
+            self.future_action_projector = (
+                nn.Identity() if future_token_dim == qwen_hidden_size else nn.Linear(future_token_dim, qwen_hidden_size)
+            )
 
     def expand_tokenizer(self, 
                          tokenizer: AutoTokenizer,
@@ -152,7 +163,12 @@ class VLA_JEPA(baseframework):
         losses_cfg = future_interface_cfg.get("losses", {})
         return float(losses_cfg.get(name, default))
 
-    def _build_loss_dict(self, action_loss_raw: torch.Tensor, wm_loss_raw: torch.Tensor):
+    def _build_loss_dict(
+        self,
+        action_loss_raw: torch.Tensor,
+        wm_loss_raw: torch.Tensor,
+        bridge_loss_raw: torch.Tensor | None = None,
+    ):
         alpha_fm = self._get_loss_weight("alpha_fm", 1.0)
         beta_wm = self._get_loss_weight("beta_wm", 0.1)
         losses = {
@@ -163,7 +179,35 @@ class VLA_JEPA(baseframework):
             "action_loss_raw": action_loss_raw.detach(),
             "wm_loss_raw": wm_loss_raw.detach(),
         }
+        if bridge_loss_raw is not None:
+            lambda_bridge = self._get_loss_weight("lambda_bridge", 0.0)
+            losses["bridge_loss"] = bridge_loss_raw * lambda_bridge
+            metrics["bridge_loss_raw"] = bridge_loss_raw.detach()
         return losses, metrics
+
+    def _project_future_targets(self, future_targets: dict):
+        return {
+            key: self.future_teacher_projector(value.detach())
+            for key, value in future_targets.items()
+        }
+
+    def _future_tokens_for_action(self, future_tokens: dict):
+        token_parts = [
+            future_tokens[key]
+            for key in ("z_prog", "z_int", "z_obj")
+            if key in future_tokens and future_tokens[key].numel() > 0 and future_tokens[key].shape[1] > 0
+        ]
+        if not token_parts:
+            raise ValueError("future_interface requires at least one enabled future token")
+        return self.future_action_projector(torch.cat(token_parts, dim=1))
+
+    def _build_future_interface(self, vlm_hidden: torch.Tensor, future_latents: torch.Tensor):
+        future_tokens = self.future_token_predictor(vlm_hidden)
+        future_targets = self.world_summary_extractor(future_latents.detach())
+        projected_targets = self._project_future_targets(future_targets)
+        future_bridge_loss = bridge_loss(future_tokens, projected_targets)
+        action_future_tokens = self._future_tokens_for_action(future_tokens)
+        return action_future_tokens, future_bridge_loss
 
     def forward(
         self,
@@ -279,9 +323,15 @@ class VLA_JEPA(baseframework):
                 gt_states,
                 reduction="mean"
             )
+            future_action_tokens, future_bridge_loss = None, None
+            if self.future_interface_enabled:
+                future_action_tokens, future_bridge_loss = self._build_future_interface(last_hidden, gt_states)
         
         if "action" not in examples[0]:
-            return {"wm_loss": teacher_forcing_wm_loss * self._get_loss_weight("beta_wm", 0.1)}
+            losses = {"wm_loss": teacher_forcing_wm_loss * self._get_loss_weight("beta_wm", 0.1)}
+            if future_bridge_loss is not None:
+                losses["bridge_loss"] = future_bridge_loss * self._get_loss_weight("lambda_bridge", 0.0)
+            return losses
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
@@ -296,6 +346,11 @@ class VLA_JEPA(baseframework):
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             embodied_action_repeated = embodied_action_tokens.repeat(repeated_diffusion_steps, 1, 1)
+            if future_action_tokens is not None:
+                embodied_action_repeated = torch.cat(
+                    (embodied_action_repeated, future_action_tokens.repeat(repeated_diffusion_steps, 1, 1)),
+                    dim=1,
+                )
             
             state_repeated = None
             if state is not None:
@@ -309,7 +364,7 @@ class VLA_JEPA(baseframework):
             #exit()
             action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
 
-        losses, _ = self._build_loss_dict(action_loss, teacher_forcing_wm_loss)
+        losses, _ = self._build_loss_dict(action_loss, teacher_forcing_wm_loss, future_bridge_loss)
         return losses
 
     @torch.inference_mode()

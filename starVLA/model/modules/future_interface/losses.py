@@ -14,7 +14,11 @@ def bridge_loss(z_hat: dict, z_star: dict):
         if pred_key not in z_hat or target_key not in z_star:
             continue
         pred = z_hat[pred_key]
+        if pred.numel() == 0 or pred.shape[1] == 0:
+            continue
         target = z_star[target_key].to(device=pred.device, dtype=pred.dtype)
+        if target.numel() == 0 or target.shape[1] == 0:
+            continue
         if target.shape[1] == 1 and pred.shape[1] != 1:
             target = target.expand(-1, pred.shape[1], -1)
         if pred.shape != target.shape:

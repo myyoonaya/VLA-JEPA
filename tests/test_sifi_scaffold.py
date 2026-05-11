@@ -102,6 +102,45 @@ def test_world_summary_extractor_global_and_masked_pooling():
     assert torch.allclose(outputs["z_obj_star"][0, 0], future_latents[0, 2])
 
 
+def test_bridge_loss_skips_disabled_empty_token_types():
+    from starVLA.model.modules.future_interface import bridge_loss
+
+    z_hat = {
+        "z_prog": torch.ones(2, 1, 4),
+        "z_int": torch.empty(2, 0, 4),
+        "z_obj": torch.empty(2, 0, 4),
+    }
+    z_star = {
+        "z_prog_star": torch.zeros(2, 1, 4),
+        "z_int_star": torch.zeros(2, 1, 4),
+        "z_obj_star": torch.zeros(2, 1, 4),
+    }
+
+    loss = bridge_loss(z_hat, z_star)
+
+    assert torch.isfinite(loss)
+
+
+def test_vla_jepa_builds_global_future_interface_for_action_conditioning():
+    from starVLA.model.framework.VLA_JEPA import VLA_JEPA
+    from starVLA.model.modules.future_interface import FutureTokenPredictor, WorldSummaryExtractor
+
+    model = VLA_JEPA.__new__(VLA_JEPA)
+    torch.nn.Module.__init__(model)
+    model.future_token_predictor = FutureTokenPredictor(vlm_dim=8, token_dim=4, n_prog=1, n_int=0, n_obj=0)
+    model.world_summary_extractor = WorldSummaryExtractor()
+    model.future_teacher_projector = torch.nn.Linear(6, 4)
+    model.future_action_projector = torch.nn.Linear(4, 8)
+
+    future_tokens, bridge = model._build_future_interface(
+        vlm_hidden=torch.randn(2, 5, 8),
+        future_latents=torch.randn(2, 3, 6),
+    )
+
+    assert future_tokens.shape == (2, 1, 8)
+    assert torch.isfinite(bridge)
+
+
 def test_training_configs_define_disabled_future_interface_defaults():
     for relative_path in ("scripts/config/vlajepa_cotrain.yaml", "scripts/config/vlajepa_robot_ft.yaml"):
         cfg = OmegaConf.load(Path(relative_path))
@@ -113,3 +152,22 @@ def test_training_configs_define_disabled_future_interface_defaults():
         assert cfg.framework.future_interface.losses.alpha_fm == 1.0
         assert cfg.framework.future_interface.losses.beta_wm == 0.1
         assert cfg.framework.future_interface.losses.lambda_bridge == 0.0
+
+
+def test_sanity_script_selects_only_trainable_parameters():
+    from scripts.sanity_check_sifi_global import collect_trainable_parameters, freeze_module
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.frozen = torch.nn.Linear(2, 2)
+            self.trainable = torch.nn.Linear(2, 2)
+
+    model = TinyModel()
+    freeze_module(model.frozen)
+
+    params = collect_trainable_parameters(model)
+
+    assert params
+    assert all(param.requires_grad for param in params)
+    assert not any(param is frozen for param in params for frozen in model.frozen.parameters())
